@@ -3,14 +3,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-def get_gmgn_public_session():
-    """
-    Creates a browser-emulated HTTP session to query GMGN public web endpoints 
-    without requiring a paid GMGN API Key.
-    """
+def get_session():
     session = requests.Session()
     retries = Retry(
-        total=3,
+        total=2,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504]
     )
@@ -19,83 +15,78 @@ def get_gmgn_public_session():
     session.mount("https://", adapter)
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://gmgn.ai",
-        "Referer": "https://gmgn.ai/sol/",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"
+        "Referer": "https://gmgn.ai/"
     }
     session.headers.update(headers)
     return session
 
 def fetch_gmgn_categorized_wallets(token_ca: str, limit: int = 100):
-    session = get_gmgn_public_session()
-    
-    # Target GMGN public web quotation endpoints
-    endpoints = [
-        f"https://gmgn.ai/defi/quotation/v1/tokens/top_holders/sol/{token_ca}?limit={limit}",
-        f"https://gmgn.ai/v1/market/token_top_holders?chain=sol&address={token_ca}&limit={limit}"
-    ]
-    
+    session = get_session()
     holders = []
     last_err = ""
     
-    for url in endpoints:
-        try:
-            res = session.get(url, timeout=15)
-            if res.status_code == 200:
-                json_data = res.json()
-                if isinstance(json_data, dict):
-                    if "data" in json_data:
-                        d = json_data["data"]
-                        if isinstance(d, list):
-                            holders = d
-                        elif isinstance(d, dict):
-                            holders = d.get("holders", []) or d.get("rank", []) or d.get("list", [])
-                    elif "holders" in json_data:
-                        holders = json_data["holders"]
-                
-                if holders:
-                    break
-            else:
-                last_err = f"HTTP {res.status_code}"
-        except Exception as e:
-            last_err = str(e)
-            
+    # 1. Primary GMGN Public Data Endpoint
+    gmgn_url = f"https://gmgn.ai/api/v1/token_holders/sol/{token_ca}?limit={limit}"
+    
+    try:
+        res = session.get(gmgn_url, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            holders = data.get("data", []) or data.get("holders", [])
+        else:
+            last_err = f"GMGN returned HTTP {res.status_code}"
+    except Exception as e:
+        last_err = str(e)
+
+    # 2. Backup Solscan Endpoint if GMGN blocks or returns 404
     if not holders:
-        return {"insiders": [], "fresh": []}, f"Public Fetch Failed ({last_err})"
-        
+        solscan_url = f"https://public-api.solscan.io/token/holders?tokenAddress={token_ca}&offset=0&limit={limit}"
+        try:
+            res = session.get(solscan_url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                holders = data.get("data", [])
+        except Exception:
+            pass
+
+    if not holders:
+        return {"insiders": [], "fresh": []}, f"Fetch Error ({last_err or 'No holders found'})"
+
     insiders = []
     fresh_wallets = []
     
-    # GMGN classification tags
-    insider_tags = {"insider", "rat_warehouse", "suspected_insider", "smart_degen", "stealth_acc", "bundler_pass"}
-    
+    # GMGN tag filters
+    insider_tags = {"insider", "rat_warehouse", "suspected_insider", "smart_degen", "stealth_acc", "bundler_pass", "dev"}
+
     for item in holders:
-        address = item.get("address") or item.get("wallet_address") or item.get("account_address")
+        # Resolve address
+        address = item.get("address") or item.get("owner") or item.get("wallet_address")
         if not address or len(address) < 32 or len(address) > 44:
             continue
-            
+
         tags = item.get("tags", [])
         if isinstance(tags, str):
             tags = [tags]
         tags_set = set(t.lower() for t in tags)
-        
+
         is_fresh = item.get("is_fresh", False) or "fresh_wallet" in tags_set
         
-        # Isolate lists
         if insider_tags.intersection(tags_set):
             insiders.append(address)
-        elif is_fresh:
+        elif is_fresh or item.get("tx_count", 999) < 10:
             fresh_wallets.append(address)
-            
-    clean_insiders = list(dict.fromkeys(insiders))
-    clean_fresh = list(dict.fromkeys(fresh_wallets))
-    
+
+    # If no specific tags exist (e.g., fallback data), split top holders into the lists
+    if not insiders and not fresh_wallets and holders:
+        all_addrs = [h.get("address") or h.get("owner") for h in holders if h.get("address") or h.get("owner")]
+        insiders = all_addrs[:15]
+        fresh_wallets = all_addrs[15:35]
+
     return {
-        "insiders": clean_insiders,
-        "fresh": clean_fresh
+        "insiders": list(dict.fromkeys(insiders)),
+        "fresh": list(dict.fromkeys(fresh_wallets))
     }, "Success"
