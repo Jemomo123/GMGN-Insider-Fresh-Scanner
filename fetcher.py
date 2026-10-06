@@ -3,9 +3,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-def get_gmgn_session():
+def get_gmgn_public_session():
     """
-    Constructs an HTTP session optimized for GMGN Solana endpoints.
+    Creates a browser-emulated HTTP session to query GMGN public web endpoints 
+    without requiring a paid GMGN API Key.
     """
     session = requests.Session()
     retries = Retry(
@@ -17,37 +18,34 @@ def get_gmgn_session():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
-    api_key = os.getenv("GMGN_API_KEY", "")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://gmgn.ai",
-        "Referer": "https://gmgn.ai/sol/"
+        "Referer": "https://gmgn.ai/sol/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"
     }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-        
     session.headers.update(headers)
     return session
 
 def fetch_gmgn_categorized_wallets(token_ca: str, limit: int = 100):
-    """
-    Solana-only wallet extractor for Insiders and Fresh Wallets.
-    """
-    session = get_gmgn_session()
+    session = get_gmgn_public_session()
     
-    # Primary & Fallback Endpoints for Solana
+    # Target GMGN public web quotation endpoints
     endpoints = [
         f"https://gmgn.ai/defi/quotation/v1/tokens/top_holders/sol/{token_ca}?limit={limit}",
         f"https://gmgn.ai/v1/market/token_top_holders?chain=sol&address={token_ca}&limit={limit}"
     ]
     
     holders = []
-    status_msg = "Failed to fetch data"
+    last_err = ""
     
     for url in endpoints:
         try:
-            res = session.get(url, timeout=12)
+            res = session.get(url, timeout=15)
             if res.status_code == 200:
                 json_data = res.json()
                 if isinstance(json_data, dict):
@@ -61,26 +59,23 @@ def fetch_gmgn_categorized_wallets(token_ca: str, limit: int = 100):
                         holders = json_data["holders"]
                 
                 if holders:
-                    status_msg = "Success"
                     break
             else:
-                status_msg = f"HTTP {res.status_code}"
+                last_err = f"HTTP {res.status_code}"
         except Exception as e:
-            status_msg = f"Error: {str(e)}"
+            last_err = str(e)
             
     if not holders:
-        return {"insiders": [], "fresh": []}, status_msg
+        return {"insiders": [], "fresh": []}, f"Public Fetch Failed ({last_err})"
         
     insiders = []
     fresh_wallets = []
     
-    # Comprehensive Solana Insider & Rat tags
+    # GMGN classification tags
     insider_tags = {"insider", "rat_warehouse", "suspected_insider", "smart_degen", "stealth_acc", "bundler_pass"}
     
     for item in holders:
         address = item.get("address") or item.get("wallet_address") or item.get("account_address")
-        
-        # Verify Solana public key length (Base58 string usually 32-44 characters)
         if not address or len(address) < 32 or len(address) > 44:
             continue
             
@@ -91,13 +86,12 @@ def fetch_gmgn_categorized_wallets(token_ca: str, limit: int = 100):
         
         is_fresh = item.get("is_fresh", False) or "fresh_wallet" in tags_set
         
-        # Category Isolation
+        # Isolate lists
         if insider_tags.intersection(tags_set):
             insiders.append(address)
         elif is_fresh:
             fresh_wallets.append(address)
             
-    # Deduplicate while preserving rank order
     clean_insiders = list(dict.fromkeys(insiders))
     clean_fresh = list(dict.fromkeys(fresh_wallets))
     
